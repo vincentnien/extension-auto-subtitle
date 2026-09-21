@@ -2,6 +2,7 @@
 
 const bsSessionCache = new Map();
 let bsGen = 0;
+let bsStarted = false;
 
 const bsCurrentVideoId = () => {
   try {
@@ -21,6 +22,32 @@ const bsSendPick = (vid, lang) =>
   );
 
 // ====== 翻譯流程 ======
+const bsTgtCode = () => {
+  const s = BS_CFG.tgtLang || '';
+  if (/TW|繁/i.test(s)) return 'zh-TW';
+  if (/HK|港/i.test(s)) return 'zh-HK';
+  if (/CN|简|簡/i.test(s)) return 'zh-CN';
+  const m = s.match(/[a-z]{2}(?:-[A-Za-z]{2})?/);
+  return m ? m[0] : 'zh-TW';
+};
+
+function bsBackupDoc(doc) {
+  const base = (BS_CFG.companionUrl || '').trim().replace(/\/+$/, '');
+  if (!base) return;
+  const payload = {
+    ...doc,
+    tgtLang: bsTgtCode(),
+    meta: { sttModel: 'native', llm: BS_CFG.model, createdAt: new Date().toISOString() }
+  };
+  BS_proxyFetch(base + '/v1/docs', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ doc: payload })
+  })
+    .then((r) => BS_LOG('doc backup', r?.ok ? 'ok' : 'HTTP ' + r?.status))
+    .catch((e) => BS_LOG('doc backup skipped:', e.message));
+}
+
 async function bsStartTranslate(doc) {
   const myGen = bsGen;
   const total = doc.cues.length;
@@ -46,9 +73,16 @@ async function bsStartTranslate(doc) {
       progress: 1
     });
   }
-  const key = doc.videoId + '|' + doc.srcLang;
-  bsSessionCache.set(key, doc.cues);
-  BS_IDB.set('doc|' + key, { videoId: doc.videoId, srcLang: doc.srcLang, cues: doc.cues });
+  const n0 = doc.cues.filter((c) => c.trans).length;
+  if (n0 > 0) {
+    const key = doc.videoId + '|' + doc.srcLang;
+    bsSessionCache.set(key, doc.cues);
+    const okSave = await BS_IDB.set('doc|' + key, { videoId: doc.videoId, srcLang: doc.srcLang, cues: doc.cues });
+    BS_LOG('cache save', key, 'trans:', n0, 'ok:', okSave);
+    bsBackupDoc(doc);
+  } else {
+    BS_LOG('cache NOT saved (0 translated lines)');
+  }
 }
 
 // ====== STT（companion）======
@@ -89,7 +123,18 @@ async function bsStartStt() {
   }
 }
 
-function bsOpenJobEvents(base, jobId, vid) {
+function bsApplySttDone(doc, vid) {
+  if (doc?.cues?.length) {
+    const cues = BS_normalizeCues(doc.cues);
+    const srcLang = doc.srcLang || '';
+    BS_STORE.setDoc({ videoId: vid, srcLang, langs: '', cues });
+    bsSessionCache.set(vid + '|' + srcLang, cues);
+    BS_IDB.set('doc|' + vid + '|' + srcLang, { videoId: vid, srcLang, cues });
+  }
+  BS_STORE.setStatus({ stage: 'done', message: '', progress: 1 });
+}
+
+function bsOpenJobEvents(base, jobId, vid, attempt = 0) {
   const port = chrome.runtime.connect({ name: 'sse' });
   BS_STORE.setStatus({ stage: 'stt', message: 'STT 排程中…' });
   const stale = () => bsCurrentVideoId() !== vid;
@@ -110,15 +155,7 @@ function bsOpenJobEvents(base, jobId, vid) {
       BS_STORE.setDoc({ videoId: vid, srcLang: msg.data?.srcLang || '', langs: '', cues });
       BS_STORE.setStatus({ stage: 'stt', message: `轉寫中…（${cues.length} 行）` });
     } else if (msg.event === 'done') {
-      const doc = msg.data?.doc;
-      if (doc?.cues?.length) {
-        const cues = BS_normalizeCues(doc.cues);
-        const srcLang = doc.srcLang || '';
-        BS_STORE.setDoc({ videoId: vid, srcLang, langs: '', cues });
-        bsSessionCache.set(vid + '|' + srcLang, cues);
-        BS_IDB.set('doc|' + vid + '|' + srcLang, { videoId: vid, srcLang, cues });
-      }
-      BS_STORE.setStatus({ stage: 'done', message: '', progress: 1 });
+      bsApplySttDone(msg.data?.doc, vid);
       port.disconnect();
     } else if (msg.event === 'error') {
       BS_STORE.setStatus({
@@ -131,8 +168,47 @@ function bsOpenJobEvents(base, jobId, vid) {
       port.disconnect();
     }
   });
-  port.onDisconnect.addListener(() => {
-    if (BS_STORE.status.stage === 'stt') {
+  // 斷線不代表 job 死了（SW 被 Chrome 殺掉、網路抖動都會斷）：
+  // 先輪詢 job 狀態，還在跑就重連 SSE，真的死了才報錯
+  port.onDisconnect.addListener(async () => {
+    if (stale() || BS_STORE.status.stage !== 'stt') return;
+    if (attempt >= 5) {
+      BS_STORE.setStatus({
+        stage: 'error',
+        message: '與 companion 的連線中斷（重連多次失敗）',
+        action: { label: '重試', run: bsStartStt }
+      });
+      return;
+    }
+    BS_STORE.setStatus({ stage: 'stt', message: '連線中斷，檢查 job 狀態…' });
+    try {
+      const r = await BS_proxyFetch(base + '/v1/jobs/' + jobId, { method: 'GET' });
+      if (stale() || BS_STORE.status.stage !== 'stt') return;
+      if (r?.ok) {
+        const j = JSON.parse(r.text);
+        if (j.status === 'done') {
+          bsApplySttDone(j.doc, vid);
+          return;
+        }
+        if (j.status === 'error') {
+          BS_STORE.setStatus({
+            stage: 'error',
+            message: 'STT 失敗：' + (j.error || '未知錯誤'),
+            action: { label: '重試', run: bsStartStt }
+          });
+          return;
+        }
+        setTimeout(() => {
+          if (!stale() && BS_STORE.status.stage === 'stt') bsOpenJobEvents(base, jobId, vid, attempt + 1);
+        }, 1500);
+        return;
+      }
+      BS_STORE.setStatus({
+        stage: 'error',
+        message: 'companion 已重啟（job 遺失），請重試',
+        action: { label: '重試', run: bsStartStt }
+      });
+    } catch {
       BS_STORE.setStatus({
         stage: 'error',
         message: '與 companion 的連線中斷',
@@ -143,15 +219,42 @@ function bsOpenJobEvents(base, jobId, vid) {
   port.postMessage({ type: 'open', url: `${base}/v1/jobs/${jobId}/events` });
 }
 
+// ====== 啟動控制（預設不作動，按 ▶ 字幕 才開始）======
+function bsIdleStatus() {
+  BS_STORE.setStatus({
+    stage: 'idle',
+    message: '',
+    progress: null,
+    action: { label: '▶ 字幕', run: bsStart }
+  });
+}
+
+function bsStart() {
+  const vid = bsCurrentVideoId();
+  if (!vid || BS_STORE.doc?.videoId === vid) return;
+  bsStarted = true;
+  bsGen++;
+  BS_STORE.setDoc(null);
+  BS_STORE.setStatus({ stage: 'loading', message: '載入字幕…', progress: null, action: null });
+  window.postMessage({ source: 'bilingual-subs-ui', type: 'SUBS_START' }, location.origin);
+}
+
 // ====== 訊息處理 ======
+const bsLangMatches = (a, b) =>
+  (a || '').split('-')[0].toLowerCase() === (b || '').split('-')[0].toLowerCase();
+
 async function bsHandleCues(payload) {
   if (payload.videoId !== bsCurrentVideoId()) {
     BS_LOG('stale cues ignored', payload.videoId);
     return;
   }
+  if (!bsStarted) {
+    BS_LOG('cues ignored (not started)');
+    return;
+  }
   await BS_CFG_READY;
   const pref = (BS_CFG.trackLang || '').trim();
-  const isPreferred = !pref || payload.srcLang === pref;
+  const isPreferred = !pref || bsLangMatches(payload.srcLang, pref);
   const doc = BS_STORE.doc;
   const sameVideo = doc?.videoId === payload.videoId;
   if (sameVideo && doc.srcLang === payload.srcLang) return;
@@ -184,6 +287,23 @@ async function bsHandleCues(payload) {
       cached = true;
     }
   }
+  if (!cues && (BS_CFG.companionUrl || '').trim()) {
+    try {
+      const base = BS_CFG.companionUrl.trim().replace(/\/+$/, '');
+      const r = await BS_proxyFetch(
+        base + '/v1/docs/' + encodeURIComponent(payload.videoId) + '?tgt=' + encodeURIComponent(bsTgtCode()),
+        { method: 'GET' }
+      );
+      if (r?.ok) {
+        const d = JSON.parse(r.text);
+        if (d?.cues?.length) {
+          cues = d.cues;
+          cached = true;
+          BS_LOG('loaded from companion docs', r.text.length, 'bytes');
+        }
+      }
+    } catch {}
+  }
   BS_STORE.setDoc({
     videoId: payload.videoId,
     srcLang: payload.srcLang,
@@ -204,6 +324,7 @@ async function bsHandleCues(payload) {
 
 async function bsHandleNone(payload) {
   if (payload.videoId !== bsCurrentVideoId()) return;
+  if (!bsStarted) return;
   bsGen++;
   BS_STORE.setDoc(null);
   await BS_CFG_READY;
@@ -223,11 +344,24 @@ function bsHandleError(payload) {
   BS_STORE.setStatus({ stage: 'error', message: '字幕抓取失敗：' + payload.message });
 }
 
-function bsHandlePickFail(payload) {
+async function bsHandlePickFail(payload) {
   const doc = BS_STORE.doc;
   if (doc?.videoId !== payload.videoId) return;
   if ((BS_CFG.trackLang || '').trim() !== payload.lang) return;
   if (doc.cues.some((c) => c.trans)) return;
+  const key = doc.videoId + '|' + doc.srcLang;
+  bsGen++;
+  let cues = bsSessionCache.get(key);
+  if (!cues) {
+    const saved = await BS_IDB.get('doc|' + key);
+    if (saved?.cues?.length) cues = saved.cues;
+  }
+  if (cues) {
+    BS_STORE.setDoc({ videoId: doc.videoId, srcLang: doc.srcLang, langs: doc.langs, cues });
+    BS_STORE.setStatus({ stage: 'done', message: '', progress: 1 });
+    BS_LOG('use cached (pick fail)', key);
+    return;
+  }
   if (!BS_CFG.apiKey) {
     BS_STORE.setStatus({ stage: 'error', message: '沒有 ' + payload.lang + ' 軌，且未設定 API key，僅顯示原文' });
     return;
@@ -251,14 +385,20 @@ window.addEventListener(
   'yt-navigate-finish',
   () => {
     const vid = bsCurrentVideoId();
-    if (vid && BS_STORE.doc?.videoId !== vid) {
-      bsGen++;
-      BS_STORE.setDoc(null);
-      BS_STORE.setStatus({ stage: 'loading', message: '載入字幕…', progress: null, action: null });
-    }
+    bsStarted = false;
+    bsGen++;
+    BS_STORE.setDoc(null);
+    if (vid) bsIdleStatus();
+    else BS_STORE.setStatus({ stage: 'idle', message: '', progress: null, action: null });
   },
   true
 );
+
+if (bsCurrentVideoId()) bsIdleStatus();
+
+try {
+  navigator.storage?.persist?.()?.catch?.(() => {});
+} catch {}
 
 if (document.body) BS_ensurePanel();
 else document.addEventListener('DOMContentLoaded', BS_ensurePanel, { once: true });

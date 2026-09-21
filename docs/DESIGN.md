@@ -154,10 +154,12 @@ GET  /health                → {engines:{mlx:"ok"}, models:[...], version}
 | STT 同音錯字 | large-v3-turbo + 校正 prompt | 品質最佳化 |
 | 音樂/靜音幻覺 | VAD + 標記行降樣式 | 視覺降噪 |
 | 廣告/seek/倍速/全螢幕 | currentTime 天然免疫倍速；seek 重算；ad 隱藏；容器鏈 | 體驗穩定 |
-| SW 死亡 | 無狀態代理 | 自動重啟 |
-| 重複 job 請求 | job 冪等（同 videoId 回同一 job/doc） | 無重複成本 |
-| yt-dlp PO token / bot 偵測 / throttle | auto 軌優先可繞過音訊下載；失敗 → 明確錯誤 + 「更新 yt-dlp」提示；退避重試 | 清楚錯誤提示 |
-| Live / Shorts / 無音訊片 | 進 job 前偵測，明確拒絕（v1 不支援清單） | 清楚錯誤提示 |
+| SW 死亡 | 無狀態代理；SSE 斷線時客端先輪詢 `GET /v1/jobs/{id}`，job 還在跑就自動重連（≤5 次），真死了才報錯 | 自動恢復 |
+| STT 模型冷啟動（首次載入/下載數百 MB～GB） | 模型載入必須在工作執行緒（不可阻塞 event loop，否則 SSE keepalive 停發 → SW 被殺 →「連線中斷」）；轉寫以 `seg.end/duration` 回報 % | 進度可見、連線不斷 |
+| 下載/轉寫無進度 | yt-dlp 加 `--newline` 逐行解析 %；ct2 逐段回報 %；SSE 重連時先補發目前 stage | UI 不再卡 0% |
+| 重複 job 請求 | job 冪等（同 videoId 回同一 job/doc）；error/cancelled job 重送 = 重跑（重試按鈕有效） | 無重複成本 |
+| yt-dlp PO token / bot 偵測 / throttle | auto 軌優先可繞過音訊下載；`--socket-timeout 30`；失敗 → 明確錯誤 + 「更新 yt-dlp」提示 | 清楚錯誤提示 |
+| Live / 無音訊片 | 進 job 前偵測，明確拒絕（v1 不支援清單）；Shorts 已支援（實測 STT 可跑完） | 清楚錯誤提示 |
 | Companion 重啟 | job 狀態落盤；stale job 由客端重送恢復 | 自動恢復 |
 
 ## 8. 模組配置

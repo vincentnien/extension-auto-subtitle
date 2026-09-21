@@ -1,6 +1,16 @@
 import os
 from pathlib import Path
 
+# .env（與 app/ 同層）：KEY=VALUE 逐行，# 註解；存在即載入（不覆蓋已設定的環境變數）
+_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+if _ENV_FILE.exists():
+    for _line in _ENV_FILE.read_text().splitlines():
+        _line = _line.strip()
+        if not _line or _line.startswith("#") or "=" not in _line:
+            continue
+        _k, _v = _line.split("=", 1)
+        os.environ.setdefault(_k.strip(), _v.strip())
+
 VERSION = "0.1.0"
 
 DATA_DIR = Path(os.environ.get("SUBS_DATA_DIR", str(Path.home() / ".cache" / "bilingual-subs")))

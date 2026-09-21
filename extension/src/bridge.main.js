@@ -16,10 +16,17 @@
   };
 
   const getPlayerResponse = () => {
-    try {
-      const r = document.getElementById('movie_player')?.getPlayerResponse?.();
-      if (r?.videoDetails) return r;
-    } catch {}
+    const candidates = [
+      document.getElementById('movie_player'),
+      document.getElementById('shorts-player'),
+      ...document.querySelectorAll('.html5-video-player')
+    ];
+    for (const p of candidates) {
+      try {
+        const r = p?.getPlayerResponse?.();
+        if (r?.videoDetails) return r;
+      } catch {}
+    }
     const r2 = window.ytInitialPlayerResponse;
     return r2?.videoDetails ? r2 : null;
   };
@@ -95,7 +102,9 @@
   const fetchAndSend = async (track, vid, langs) => {
     const res = await fetch(track.baseUrl + '&fmt=json3', { credentials: 'include' });
     const body = await res.text();
-    if (!res.ok || !body.length) throw new Error('timedtext 拒絕（HTTP ' + res.status + '）');
+    if (!res.ok || !body.length) {
+      throw new Error('timedtext 拒絕（HTTP ' + res.status + '，' + body.length + ' bytes）');
+    }
     let cues = flattenJson3(JSON.parse(body));
     if (track.kind === 'asr') cues = dedupeRolling(cues);
     cues = cues.filter((c) => c.end > c.start && c.text).map((c, i) => ({ id: i, ...c }));
@@ -108,12 +117,11 @@
   };
 
   let inFlightVid = null;
-  const okVids = new Set();
 
   const capture = async () => {
     const vid = currentVideoId();
     if (!vid) return;
-    if (inFlightVid === vid || okVids.has(vid)) return;
+    if (inFlightVid === vid) return;
     inFlightVid = vid;
     log('capture start', vid);
     try {
@@ -129,8 +137,20 @@
       }
       const track = pickTrack(tracklist);
       log('picked track:', track.languageCode, track.kind === 'asr' ? '(asr)' : '(manual)');
-      await fetchAndSend(track, vid, tracks.map((t) => t.languageCode).join(','));
-      okVids.add(vid);
+      const langs = tracks.map((t) => t.languageCode).join(',');
+      const order = [track, ...tracks.filter((t) => t !== track)].slice(0, 4);
+      let lastErr = null;
+      for (const t of order) {
+        try {
+          await fetchAndSend(t, vid, langs);
+          return;
+        } catch (e) {
+          lastErr = e;
+          log('track failed:', t.languageCode, String(e?.message || e));
+        }
+      }
+      log('all tracks failed → fall back to STT route:', lastErr?.message);
+      send('SUBS_NONE', { videoId: vid });
     } catch (e) {
       console.error('[bs-bridge] capture failed:', e);
       send('SUBS_ERROR', { message: String(e?.message || e) });
@@ -142,25 +162,27 @@
   window.addEventListener('message', (e) => {
     if (e.origin !== location.origin) return;
     const msg = e.data;
-    if (!msg || msg.source !== 'bilingual-subs-ui' || msg.type !== 'SUBS_PICK') return;
-    const { videoId, lang } = msg.payload || {};
-    if (!videoId || videoId !== currentVideoId() || !lang) return;
-    const tracklist = getPlayerResponse()?.captions?.playerCaptionsTracklistRenderer;
-    const tracks = tracklist?.captionTracks || [];
-    const track =
-      tracks.find((t) => t.kind !== 'asr' && t.languageCode === lang) ||
-      tracks.find((t) => t.languageCode === lang);
-    log('pick', lang, '→', track ? track.languageCode : 'not found');
-    if (!track) {
-      send('SUBS_PICK_FAIL', { videoId, lang });
-      return;
+    if (!msg || msg.source !== 'bilingual-subs-ui') return;
+    if (msg.type === 'SUBS_START') capture();
+    else if (msg.type === 'SUBS_PICK') {
+      const { videoId, lang } = msg.payload || {};
+      if (!videoId || videoId !== currentVideoId() || !lang) return;
+      const tracklist = getPlayerResponse()?.captions?.playerCaptionsTracklistRenderer;
+      const tracks = tracklist?.captionTracks || [];
+      const langMatch = (code) =>
+        (code || '').split('-')[0].toLowerCase() === lang.split('-')[0].toLowerCase();
+      const track =
+        tracks.find((t) => t.kind !== 'asr' && langMatch(t.languageCode)) ||
+        tracks.find((t) => langMatch(t.languageCode));
+      log('pick', lang, '→', track ? track.languageCode : 'not found');
+      if (!track) {
+        send('SUBS_PICK_FAIL', { videoId, lang });
+        return;
+      }
+      fetchAndSend(track, videoId, tracks.map((t) => t.languageCode).join(',')).catch((err) => {
+        console.error('[bs-bridge] pick fetch failed:', err);
+        send('SUBS_ERROR', { message: String(err?.message || err) });
+      });
     }
-    fetchAndSend(track, videoId, tracks.map((t) => t.languageCode).join(',')).catch((err) => {
-      console.error('[bs-bridge] pick fetch failed:', err);
-      send('SUBS_ERROR', { message: String(err?.message || err) });
-    });
   });
-
-  window.addEventListener('yt-navigate-finish', () => setTimeout(capture, 300), true);
-  capture();
 })();

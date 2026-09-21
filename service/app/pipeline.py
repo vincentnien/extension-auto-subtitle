@@ -32,6 +32,10 @@ async def ensure_audio(video_id: str, url: str, emit) -> str:
         "-f",
         "bestaudio[ext=m4a]/bestaudio",
         "--no-playlist",
+        # --newline：進度以獨立行輸出（否則用 \r 連接，整段下載只會在最後收到一次）
+        "--newline",
+        "--socket-timeout",
+        "30",
         *config.YTDLP_EXTRA_ARGS,
         "-o",
         str(tmp),
@@ -46,9 +50,9 @@ async def ensure_audio(video_id: str, url: str, emit) -> str:
         tail.append(s)
         if len(tail) > 20:
             tail.pop(0)
-        m = rx.search(s)
-        if m:
-            emit("progress", {"stage": "downloading", "progress": float(m.group(1)) / 100})
+        matches = rx.findall(s)
+        if matches:
+            emit("progress", {"stage": "downloading", "progress": float(matches[-1]) / 100})
     rc = await proc.wait()
     if rc != 0 or not tmp.exists():
         raise RuntimeError(
@@ -82,7 +86,12 @@ async def run(video_id: str, url: str, tgt_lang: str, stt_model: str | None = No
 
         async with _STT_SEMAPHORE:
             emit("progress", {"stage": "transcribing", "progress": None})
-            raw, src_lang = await stt.transcribe(audio, None, on_partial)
+            raw, src_lang = await stt.transcribe(
+                audio,
+                None,
+                on_partial,
+                on_progress=lambda p: emit("progress", {"stage": "transcribing", "progress": p}),
+            )
         cues = normalize_cues(raw)
         cache.save_json(cache.cues_path(video_id, stt_name), {"srcLang": src_lang, "cues": cues})
         src_lang = src_lang or ""

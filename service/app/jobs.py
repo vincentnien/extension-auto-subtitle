@@ -79,6 +79,11 @@ def sse_frame(event: str, data: dict) -> str:
 
 
 async def start(job: Job) -> None:
+    job.status = "queued"
+    job.stage = ""
+    job.progress = None
+    job.error = None
+    job.doc = None
     job.task = asyncio.create_task(_run(job))
 
 

@@ -34,6 +34,25 @@ class JobIn(BaseModel):
     stt_model: str | None = None
 
 
+class DocIn(BaseModel):
+    doc: dict
+
+
+@app.post("/v1/docs", status_code=201)
+async def save_doc(body: DocIn, _=Depends(auth)):
+    doc = body.doc
+    video_id = doc.get("videoId")
+    if not video_id:
+        raise HTTPException(status_code=400, detail="doc.videoId required")
+    tgt = doc.get("tgtLang") or "zh-TW"
+    meta = doc.get("meta") or {}
+    stt = meta.get("sttModel") or "native"
+    llm = meta.get("llm") or "unknown"
+    path = cache.doc_path(video_id, stt, tgt, llm)
+    cache.save_json(path, doc)
+    return {"saved": path.name}
+
+
 @app.post("/v1/jobs", status_code=202)
 async def create_job(body: JobIn, _=Depends(auth)):
     video_id = body.video_id or (pipeline.extract_video_id(body.url) if body.url else None)
@@ -41,9 +60,11 @@ async def create_job(body: JobIn, _=Depends(auth)):
         raise HTTPException(status_code=400, detail="需要 video_id 或可解析的 url")
     url = body.url or f"https://www.youtube.com/watch?v={video_id}"
     job, existed = jobs.get_or_create(video_id, url, body.tgt_lang, body.stt_model)
-    if not existed and (job.task is None or job.task.done()):
-        if job.status not in ("done", "error", "cancelled"):
-            await jobs.start(job)
+    # error/cancelled 的 job 重送 = 重跑（「重試」按鈕才有意義；磁碟快取讓重跑很快）
+    if job.status in ("error", "cancelled") or (
+        job.status == "queued" and (job.task is None or job.task.done())
+    ):
+        await jobs.start(job)
     cached = cache.find_doc(video_id, body.tgt_lang) is not None
     return {"job_id": job.id, "status": job.status, "cache": "hit" if cached else "miss"}
 
@@ -77,6 +98,9 @@ async def job_events(job_id: str, _=Depends(auth)):
             if job.status == "error" and job.error:
                 yield jobs.sse_frame("error", {"message": job.error})
                 return
+            # 重連的客端先拿到目前狀態，再接續後續事件
+            if job.stage:
+                yield jobs.sse_frame("progress", {"stage": job.stage, "progress": job.progress})
             while True:
                 try:
                     event, data = await asyncio.wait_for(q.get(), timeout=15)
