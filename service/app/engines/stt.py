@@ -1,7 +1,8 @@
 """STT 引擎介面：mlx（Mac GPU）| ct2（CPU fallback）| groq（雲端），自動偵測。
 
-介面：transcribe(audio_path, language?) -> (cues, src_lang)
-ct2 串流回傳段落（邊轉邊推）；mlx/groq 為批次。
+介面：transcribe(audio_path, language?, on_partial?, on_progress?) -> (cues, src_lang)
+ct2 串流回傳段落（邊轉邊推 + % 進度）；mlx/groq 為批次。
+注意：模型載入/下載必須在工作執行緒進行，不可阻塞 event loop（否則 SSE 停擺）。
 """
 
 import asyncio
@@ -58,22 +59,13 @@ def resolve_model_name() -> str:
     return config.STT_MODEL or engine_model(pick_engine())
 
 
-async def transcribe(audio_path: str, language: str | None = None, on_partial=None):
+async def transcribe(audio_path: str, language: str | None = None, on_partial=None, on_progress=None):
     name = pick_engine()
     if name == "ct2":
-        return await _ct2(audio_path, language, on_partial)
+        return await _ct2(audio_path, language, on_partial, on_progress)
     if name == "mlx":
         return await _mlx(audio_path, language, on_partial)
     return await _groq(audio_path, language, on_partial)
-
-
-def _get_ct2_model():
-    name = config.STT_MODEL or engine_model("ct2")
-    if name not in _MODEL_CACHE:
-        from faster_whisper import WhisperModel
-
-        _MODEL_CACHE[name] = WhisperModel(name, device="auto", compute_type="auto")
-    return _MODEL_CACHE[name]
 
 
 def _get_ct2_model():
@@ -98,17 +90,20 @@ def _refine_with_words(cue: dict, seg) -> dict:
     return cue
 
 
-async def _ct2(audio_path: str, language: str | None, on_partial):
-    model = _get_ct2_model()
+async def _ct2(audio_path: str, language: str | None, on_partial, on_progress=None):
     q: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
     def work():
         try:
+            # 模型載入（首次含 HF 下載，可能數分鐘）必須在執行緒內：
+            # 在 event loop 上同步執行會凍結整個 service（SSE keepalive 停發 → 客端斷線）
+            model = _get_ct2_model()
             segments, info = model.transcribe(
                 audio_path, language=language, vad_filter=True, word_timestamps=True
             )
             loop.call_soon_threadsafe(q.put_nowait, ("lang", info.language))
+            duration = getattr(info, "duration", 0) or 0
             for seg in segments:
                 text = seg.text.strip()
                 if text:
@@ -116,11 +111,13 @@ async def _ct2(audio_path: str, language: str | None, on_partial):
                         {"start": seg.start, "end": seg.end, "text": text}, seg
                     )
                     loop.call_soon_threadsafe(q.put_nowait, ("seg", cue))
+                if on_progress and duration > 0:
+                    loop.call_soon_threadsafe(
+                        q.put_nowait, ("prog", min(seg.end / duration, 1.0))
+                    )
             loop.call_soon_threadsafe(q.put_nowait, ("eof", None))
         except Exception as e:  # noqa: BLE001
             loop.call_soon_threadsafe(q.put_nowait, ("err", e))
-
-    import threading
 
     threading.Thread(target=work, daemon=True).start()
     cues: list[dict] = []
@@ -134,6 +131,9 @@ async def _ct2(audio_path: str, language: str | None, on_partial):
             if on_partial and buf >= 10:
                 on_partial(list(cues), lang)
                 buf = 0
+        elif kind == "prog":
+            if on_progress:
+                on_progress(payload)
         elif kind == "lang":
             lang = payload
         elif kind == "eof":

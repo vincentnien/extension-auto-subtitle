@@ -55,7 +55,7 @@ async function BS_geminiCall(sys, user) {
   const body = {
     systemInstruction: { parts: [{ text: sys }] },
     contents: [{ role: 'user', parts: [{ text: user }] }],
-    generationConfig: { temperature: 0.2, responseMimeType: 'application/json' }
+    generationConfig: { temperature: 0.2, responseMimeType: 'application/json', thinkingConfig: { thinkingBudget: 0 } }
   };
   const init = {
     method: 'POST',
@@ -64,7 +64,20 @@ async function BS_geminiCall(sys, user) {
   };
   for (let n = 0; ; n++) {
     const r = await BS_proxyFetch(url, init);
-    if (r?.ok) return r.text;
+    if (r?.ok) {
+      let data = null;
+      try {
+        data = JSON.parse(r.text);
+      } catch {}
+      const cand = data?.candidates?.[0];
+      const parts = cand?.content?.parts || [];
+      const text = parts.filter((p) => !p.thought).map((p) => p.text || '').join('');
+      if (!text.trim()) {
+        const reason = cand?.finishReason || data?.promptFeedback?.blockReason || 'empty';
+        throw new Error('Gemini 回應為空（' + reason + '）');
+      }
+      return text;
+    }
     const transient = r?.status === 429 || r?.status === 500 || r?.status === 503;
     if (n >= 3 || !transient) {
       throw new Error('Gemini HTTP ' + r?.status + ' ' + (r?.text || '').slice(0, 120));

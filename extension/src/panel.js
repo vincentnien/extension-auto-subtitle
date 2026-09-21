@@ -33,12 +33,18 @@ const BS_PANEL_CSS = `
   .bs-tab { position: fixed; right: 0; top: 40%; writing-mode: vertical-rl; padding: 12px 5px;
     background: #1a73e8; color: #fff; border-radius: 6px 0 0 6px; cursor: pointer; font-size: 12px;
     letter-spacing: 2px; display: none; pointer-events: auto; }
+  .bs-resizer { position: absolute; left: 0; top: 0; height: 100%; width: 7px; margin-left: -3px;
+    cursor: ew-resize; pointer-events: auto; z-index: 10; }
+  .bs-resizer:hover, .bs-resizer.dragging { background: rgba(26,115,232,.4); }
 `;
 
 const BS_PANEL_WIDTH = 340;
+const BS_PANEL_MIN_W = 220;
+const BS_PANEL_MAX_W = 640;
 
 let bsPanelHost = null;
 let bsPanelShadow = null;
+let bsPanelEl = null;
 let bsPanelListEl = null;
 let bsPanelBarFill = null;
 let bsPanelMsgEl = null;
@@ -52,6 +58,40 @@ let bsPanelVisible = false;
 let bsPanelUserCollapsed = false;
 let bsPanelUserScrolledAt = 0;
 let bsPanelMode = localStorage.getItem('bs-panel-mode') || 'both'; // both | orig | trans
+let bsPanelWidth = Number(localStorage.getItem('bs-panel-w')) || BS_PANEL_WIDTH;
+
+function bsPanelApplyWidth() {
+  if (!bsPanelHost) return;
+  const w = Math.min(bsPanelWidth, Math.max(BS_PANEL_MIN_W, window.innerWidth - 80));
+  bsPanelHost.style.width = w + 'px';
+}
+
+function bsPanelSetupResizer(handle) {
+  let dragging = false;
+  handle.addEventListener('pointerdown', (e) => {
+    dragging = true;
+    handle.classList.add('dragging');
+    handle.setPointerCapture(e.pointerId);
+  });
+  handle.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    bsPanelWidth = Math.max(BS_PANEL_MIN_W, Math.min(BS_PANEL_MAX_W, window.innerWidth - e.clientX));
+    bsPanelApplyWidth();
+  });
+  const done = () => {
+    if (!dragging) return;
+    dragging = false;
+    handle.classList.remove('dragging');
+    localStorage.setItem('bs-panel-w', String(bsPanelWidth));
+  };
+  handle.addEventListener('pointerup', done);
+  handle.addEventListener('pointercancel', done);
+  handle.addEventListener('dblclick', () => {
+    bsPanelWidth = BS_PANEL_WIDTH;
+    bsPanelApplyWidth();
+    localStorage.setItem('bs-panel-w', String(bsPanelWidth));
+  });
+}
 
 function BS_panelSpeak(text) {
   try {
@@ -63,17 +103,19 @@ function BS_panelSpeak(text) {
 }
 
 function BS_panelSeek(t) {
-  const player = document.getElementById('movie_player');
+  const player =
+    document.getElementById('movie_player') || document.getElementById('shorts-player');
   const video = player?.querySelector('video');
   if (!video || player?.classList.contains('ad-showing')) return;
   video.currentTime = t + 0.01;
 }
 
 function BS_panelApplyVisibility() {
-  const fs = !!document.fullscreenElement;
-  const show = bsPanelVisible && !fs;
-  if (bsPanelHost) bsPanelHost.style.display = show ? 'block' : 'none';
-  if (bsPanelTab) bsPanelTab.style.display = !show ? 'flex' : 'none';
+  const show = bsPanelVisible && !document.fullscreenElement;
+  const panelShow = show ? 'flex' : 'none';
+  const tabShow = show ? 'none' : 'flex';
+  if (bsPanelEl) bsPanelEl.style.display = panelShow;
+  if (bsPanelTab) bsPanelTab.style.display = tabShow;
 }
 
 function BS_setPanelVisible(visible, byUser) {
@@ -87,8 +129,7 @@ function BS_ensurePanel() {
   bsPanelHost?.remove();
   bsPanelTab?.remove();
   bsPanelHost = document.createElement('div');
-  bsPanelHost.style.cssText = `position:fixed;top:0;right:0;width:${BS_PANEL_WIDTH}px;height:100vh;z-index:2147483000;pointer-events:none;`;
-  bsPanelShadow = bsPanelHost.attachShadow({ mode: 'open' });
+  bsPanelHost.style.cssText = `position:fixed;top:0;right:0;width:${BS_PANEL_WIDTH}px;height:100vh;z-index:2147483000;pointer-events:none;`;  bsPanelShadow = bsPanelHost.attachShadow({ mode: 'open' });
   const style = document.createElement('style');
   style.textContent = BS_PANEL_CSS;
   const panel = document.createElement('div');
@@ -116,6 +157,13 @@ function BS_ensurePanel() {
     setDubLabel();
   });
   setDubLabel();
+  const cacheBtn = document.createElement('button');
+  cacheBtn.textContent = '清快取';
+  cacheBtn.title = '刪除本機快取的字幕翻譯';
+  cacheBtn.addEventListener('click', async () => {
+    await BS_IDB.clear();
+    location.reload();
+  });
   const exportBtn = document.createElement('button');
   exportBtn.textContent = '匯出 SRT';
   exportBtn.addEventListener('click', () => {
@@ -133,7 +181,7 @@ function BS_ensurePanel() {
   const collapseBtn = document.createElement('button');
   collapseBtn.textContent = '收合';
   collapseBtn.addEventListener('click', () => BS_setPanelVisible(false, true));
-  btns.append(modeBtn, dubBtn, exportBtn, collapseBtn);
+  btns.append(modeBtn, dubBtn, cacheBtn, exportBtn, collapseBtn);
   head.append(title, btns);
   const bar = document.createElement('div');
   bar.className = 'bs-bar';
@@ -149,11 +197,17 @@ function BS_ensurePanel() {
   panel.append(head, bsPanelMsgEl, bar, bsPanelBtnEl, bsPanelListEl);
   bsPanelShadow.append(style, panel);
   document.body.appendChild(bsPanelHost);
+  bsPanelEl = panel;
+  bsPanelApplyWidth();
+  const resizer = document.createElement('div');
+  resizer.className = 'bs-resizer';
+  bsPanelSetupResizer(resizer);
+  bsPanelShadow.appendChild(resizer);
   bsPanelTab = document.createElement('div');
   bsPanelTab.className = 'bs-tab';
   bsPanelTab.textContent = '雙語字幕';
   bsPanelTab.addEventListener('click', () => BS_setPanelVisible(true, true));
-  document.body.appendChild(bsPanelTab);
+  bsPanelShadow.appendChild(bsPanelTab);
   document.addEventListener('fullscreenchange', BS_panelApplyVisibility);
   BS_setPanelVisible(false, false);
 }
