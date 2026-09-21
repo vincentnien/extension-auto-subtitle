@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="utf-8" />
+  <title>Bilingual Subs 設定</title>
+  <style>
+    body { font: 14px/1.6 system-ui, 'Noto Sans TC', sans-serif; max-width: 480px; margin: 40px auto; padding: 0 16px; color: #222; }
+    label { display: block; margin: 16px 0 4px; font-weight: 600; }
+    input { width: 100%; box-sizing: border-box; padding: 8px 10px; border: 1px solid #ccc; border-radius: 6px; font: inherit; }
+    button { margin-top: 20px; padding: 8px 20px; border: 0; border-radius: 6px; background: #1a73e8; color: #fff; font: inherit; cursor: pointer; }
+    #msg { margin-left: 12px; color: #188038; }
+    .hint { color: #777; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h3>Bilingual Subs 設定</h3>
+  <label for="apiKey">Gemini API key</label>
+  <input id="apiKey" type="password" placeholder="貼上 Google AI Studio 的 API key" />
+  <div class="hint">存於 chrome.storage.local，僅本機使用</div>
+
+  <label for="model">模型</label>
+  <input id="model" type="text" placeholder="gemini-flash-latest" />
+
+  <label for="tgtLang">目標語言</label>
+  <input id="tgtLang" type="text" placeholder="繁體中文（zh-TW）" />
+
+  <label for="trackLang">字幕軌語言（留空 = 自動）</label>
+  <input id="trackLang" type="text" placeholder="例如：en、ja" />
+  <div class="hint">影片有多國字幕軌時，指定要當「原文」的軌；自動模式會優先挑與影片音訊語言一致的軌</div>
+
+  <label for="companionUrl">Companion URL（語音辨識服務，留空停用）</label>
+  <input id="companionUrl" type="text" placeholder="http://127.0.0.1:8765" />
+  <div class="hint">影片沒有字幕軌時，可呼叫本機服務跑 STT</div>
+
+  <button id="save">儲存</button><span id="msg"></span>
+
+  <script src="options.js"></script>
+</body>
+</html>

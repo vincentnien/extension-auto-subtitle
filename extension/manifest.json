@@ -1,0 +1,43 @@
+{
+  "manifest_version": 3,
+  "name": "Bilingual Subs MVP",
+  "version": "0.1.0",
+  "description": "YouTube 雙語字幕 MVP：原生字幕 + Gemini 翻譯",
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "permissions": ["storage"],
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.youtube.com/*"],
+      "js": [
+        "src/proxy.js",
+        "src/store.js",
+        "src/doc.js",
+        "src/idb.js",
+        "src/translate.js",
+        "src/overlay.js",
+        "src/panel.js",
+        "src/content.js"
+      ],
+      "run_at": "document_start",
+      "world": "ISOLATED"
+    },
+    {
+      "matches": ["https://www.youtube.com/*"],
+      "js": ["src/bridge.main.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ],
+  "host_permissions": [
+    "https://generativelanguage.googleapis.com/*",
+    "http://127.0.0.1:8765/*",
+    "http://localhost:8765/*",
+    "https://*.ts.net/*"
+  ]
+}
